@@ -1,0 +1,18 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+# Data & outputs
+data/
+derivatives/
+figures/
+reports/
+*.log
+*.npy
+*.fif
+*.parquet

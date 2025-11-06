@@ -1,0 +1,14 @@
+mne==1.7.1
+mne-bids==0.15
+pybids==0.16.4
+hedtools==0.5.0
+autoreject==0.4.3
+pyriemann==0.5
+neuroHarmonize==2.4.5
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+scikit-learn==1.5.1
+matplotlib==3.8.4
+statsmodels==0.14.2
+streamlit==1.39.0
