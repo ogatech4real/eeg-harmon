@@ -5,4 +5,6 @@ from .neuroCombat import (  # noqa: F401
     make_design_matrix,
     adjust_data_final,
     find_parametric_adjustments,
+    aprior,
+    bprior,
 )
