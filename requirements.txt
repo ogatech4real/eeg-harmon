@@ -2,13 +2,18 @@ mne==1.7.1
 mne-bids==0.15
 pybids==0.16.4
 autoreject==0.4.3
-pyriemann==0.9
-neuroHarmonize==0.2.1
+
+# Riemannian + ComBat stack, pinned for NumPy 1.26
+pyriemann==0.8
+neuroHarmonize==2.4.5
+
+# Core scientific pins (NumPy 1.x line)
 numpy==1.26.4
 scipy==1.13.1
 pandas==2.2.2
 scikit-learn==1.5.1
 matplotlib==3.8.4
-statsmodels==0.14.2
+
+# App + utilities
 streamlit==1.39.0
 requests==2.32.3
