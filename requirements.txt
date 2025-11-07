@@ -4,6 +4,7 @@ pybids==0.16.4
 # hedtools==0.7.1   # optional; keep commented unless you use it
 autoreject==0.4.3
 neuroHarmonize==0.2.1
+pyriemann==0.9
 numpy==1.26.4
 scipy==1.13.1
 pandas==2.2.2
