@@ -2,8 +2,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from neuroHarmonize import harmonizationLearn, harmonizationApply
-from pyriemann.utils.mean import mean_riemann
-from pyriemann.utils.base import logm, expm
+
+# Safe guard: pyriemann may be missing; we keep CSD optional and explicit.
+_HAS_PYRIEMANN = True
+try:
+    from pyriemann.utils.mean import mean_riemann
+    from pyriemann.utils.base import logm, expm
+except Exception:
+    _HAS_PYRIEMANN = False
+
 from numpy.linalg import cholesky, inv
 
 def combat_vector_features(df: pd.DataFrame, feature_cols: list[str], batch_col: str, covars: list[str] | None = None):
@@ -19,7 +26,13 @@ def combat_vector_features(df: pd.DataFrame, feature_cols: list[str], batch_col:
     return out, model
 
 def combat_riemann(Cs: list[np.ndarray], batch: list[str], covars: pd.DataFrame | None = None):
-    """Log-map CSDs to tangent space, run ComBat, exp-map back."""
+    """
+    Log-map SPD CSDs to tangent space, run ComBat, exp-map back.
+    Requires pyriemann; raises RuntimeError if unavailable.
+    """
+    if not _HAS_PYRIEMANN:
+        raise RuntimeError("pyriemann not installed; install pyriemann==0.9 or disable CSD harmonisation.")
+
     Cs = np.asarray(Cs)
     Cref = mean_riemann(Cs)
     L = cholesky(Cref); Linv = inv(L)
