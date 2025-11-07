@@ -20,33 +20,21 @@ def make_design_matrix(
     drop_first: bool = True,
     add_intercept: bool = True,
 ) -> _pd.DataFrame:
-    """
-    Legacy-style design-matrix builder for pipelines that expect this symbol.
-    neuroHarmonize doesn't require it; we keep it for import compatibility.
-    """
     df = _to_dataframe(covars)
-
     if batch_col not in df.columns:
         raise ValueError(f"'{batch_col}' column is required in covariates for ComBat/neuroHarmonize.")
-
     if categorical_cols is None and continuous_cols is None:
         categorical_cols = [c for c in df.columns if df[c].dtype == "object" or df[c].dtype.name == "category"]
         continuous_cols = [c for c in df.columns if c not in categorical_cols]
-
     categorical_cols = list(categorical_cols or [])
     continuous_cols = list(continuous_cols or [])
-
     if batch_col not in categorical_cols:
         categorical_cols = [batch_col] + categorical_cols
-
     X_cat = _pd.get_dummies(df[categorical_cols].astype("category"), drop_first=drop_first)
     X_cont = df[continuous_cols].apply(_pd.to_numeric, errors="coerce") if continuous_cols else _pd.DataFrame(index=df.index)
-
     X = _pd.concat([X_cat, X_cont], axis=1)
-
     if add_intercept and "intercept" not in X.columns:
         X.insert(0, "intercept", 1.0)
-
     return X
 
 # ---------- legacy API shims ----------
@@ -57,22 +45,14 @@ def neuroCombat(
     parametric: bool = True,
     **kwargs,
 ):
-    """
-    Legacy API shim for neuroCombat → backed by neuroHarmonize.
-    Returns (harmonized, model) to match prior expectations.
-    """
     X = _np.asarray(dat.values if isinstance(dat, _pd.DataFrame) else dat)
     cov = _to_dataframe(covars)
-
-    # Accept legacy kwarg `batch=` and inject it into covars if not present
     batch = kwargs.pop("batch", None)
     if batch is not None and "batch" not in cov.columns:
         cov = cov.copy()
         cov["batch"] = _np.asarray(batch).ravel()
-
     if "batch" not in cov.columns:
         raise ValueError("Covariates must include a 'batch' column for ComBat/neuroHarmonize.")
-
     model = harmonizationLearn(X, cov, eb=eb, parametric=parametric)
     Xh = harmonizationApply(X, cov, model)
     return Xh, model
@@ -82,9 +62,6 @@ def neuroCombatFromTraining(
     model: dict,
     covars: _t.Union[_pd.DataFrame, dict],
 ):
-    """
-    Legacy apply-only function. Mirrors old behavior via harmonizationApply.
-    """
     X = _np.asarray(dat.values if isinstance(dat, _pd.DataFrame) else dat)
     cov = _to_dataframe(covars)
     if "batch" not in cov.columns:
@@ -96,10 +73,6 @@ def adjust_data_final(
     covars: _t.Union[_pd.DataFrame, dict],
     estimates_or_model: dict,
 ):
-    """
-    Legacy helper name sometimes imported from neuroCombat.neuroCombat.
-    Semantics: apply a learned model/estimates to new data.
-    """
     X = _np.asarray(dat.values if isinstance(dat, _pd.DataFrame) else dat)
     cov = _to_dataframe(covars)
     if "batch" not in cov.columns:
@@ -113,22 +86,38 @@ def find_parametric_adjustments(
     parametric: bool = True,
     **kwargs,
 ) -> dict:
-    """
-    Legacy training function expected by some pipelines.
-    Returns a learned model (i.e., parameter estimates) using neuroHarmonize.
-    Intended to be consumed by `adjust_data_final(dat, covars, model)`.
-    """
     X = _np.asarray(dat.values if isinstance(dat, _pd.DataFrame) else dat)
     cov = _to_dataframe(covars)
-
-    # Accept legacy kwarg `batch=` and inject it into covars if not present
     batch = kwargs.pop("batch", None)
     if batch is not None and "batch" not in cov.columns:
         cov = cov.copy()
         cov["batch"] = _np.asarray(batch).ravel()
-
     if "batch" not in cov.columns:
         raise ValueError("Covariates must include a 'batch' column for ComBat/neuroHarmonize.")
-
     model = harmonizationLearn(X, cov, eb=eb, parametric=parametric)
     return model
+
+# ---------- legacy EB helper shims ----------
+def aprior(s2: _t.Union[_np.ndarray, list, _pd.Series]) -> tuple[float, float]:
+    """
+    Legacy: method-of-moments estimate of Inverse-Gamma(alpha, beta) for a set of
+    batch variance estimates s2. Returns (alpha, beta). Safe fallback used rarely.
+    """
+    arr = _np.asarray(s2, dtype=float).ravel()
+    if arr.size < 2 or _np.allclose(arr.var(ddof=1), 0.0):
+        # Degenerate case: weakly-informative prior
+        alpha = 2.0
+        beta = max(arr.mean(), 1e-6) * (alpha - 1.0)
+        return float(alpha), float(beta)
+    m = arr.mean()
+    v = arr.var(ddof=1)
+    alpha = (m**2 / v) + 2.0
+    beta = m * (alpha - 1.0)
+    return float(alpha), float(beta)
+
+def bprior(s2: _t.Union[_np.ndarray, list, _pd.Series]) -> float:
+    """
+    Legacy companion returning just the beta parameter for convenience.
+    """
+    _, beta = aprior(s2)
+    return float(beta)
