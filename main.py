@@ -17,7 +17,8 @@ from src.features import bandpowers, cross_spectra, erp_peaks
 from src.harmonize import combat_vector_features, combat_riemann
 from src.metrics import site_variance_ratio
 
-class PipelineError(Exception): ...
+class PipelineError(Exception):
+    ...
 
 # --- utilities ----------------------------------------------------------------
 def _unzip_if_needed(upload: Path, dest_dir: Path) -> Path:
@@ -118,11 +119,11 @@ def run_pipeline(
 
         # KPI pre
         feat = "alpha" if "alpha" in df_wide.columns else [c for c in df_wide.columns if c not in {"epoch","site"}][0]
-        pre_ratio = site_variance_ratio(df_wide.rename(columns={feat:"feat"}), ["feat"], "site")
+        pre_ratio = site_variance_ratio(df_wide.rename(columns={feat: "feat"}), ["feat"], "site")
 
         # 5) Vector ComBat
         df_h, _ = combat_vector_features(
-            df_wide.rename(columns={feat:"feat"}), feature_cols=["feat"], batch_col="site", covars=[]
+            df_wide.rename(columns={feat: "feat"}), feature_cols=["feat"], batch_col="site", covars=[]
         )
         post_ratio = site_variance_ratio(df_h, ["feat"], "site")
 
@@ -135,21 +136,29 @@ def run_pipeline(
         out_feat_h.parent.mkdir(parents=True, exist_ok=True)
         df_h.to_parquet(out_feat_h, index=False)
 
-        # 6) CSD (Riemannian) — optional
+        # 6) CSD (Riemannian) — optional and resilient
         csd_outputs = {}
         if include_csd:
-            Cs = cross_spectra(epochs, fmin=8.0, fmax=30.0, method="multitaper")
-            # If site labels are single-valued, synthesise a simple A/B split to visualise the effect
-            if len(set(site_vec)) == 1:
-                batch = ["siteA" if (i % 2 == 0) else "siteB" for i in range(n_epochs)]
-            else:
-                batch = site_vec
-            Cs_h = combat_riemann(Cs, batch=batch, covars=None)
-            out_csd_pre = Path(P.derivatives / "harmonized" / "csd" / "csd_pre.npy")
-            out_csd_post = Path(P.derivatives / "harmonized" / "csd" / "csd_post_harmonized.npy")
-            out_csd_pre.parent.mkdir(parents=True, exist_ok=True)
-            np.save(out_csd_pre, np.stack(Cs)); np.save(out_csd_post, np.stack(Cs_h))
-            csd_outputs = {"csd_pre": str(out_csd_pre), "csd_post": str(out_csd_post)}
+            try:
+                Cs = cross_spectra(epochs, fmin=8.0, fmax=30.0, method="multitaper")
+                # If site labels are single-valued, synthesise a simple A/B split to visualise the effect
+                if len(set(site_vec)) == 1:
+                    batch = ["siteA" if (i % 2 == 0) else "siteB" for i in range(n_epochs)]
+                else:
+                    batch = site_vec
+                Cs_h = combat_riemann(Cs, batch=batch, covars=None)
+                out_csd_pre = Path(P.derivatives / "harmonized" / "csd" / "csd_pre.npy")
+                out_csd_post = Path(P.derivatives / "harmonized" / "csd" / "csd_post_harmonized.npy")
+                out_csd_pre.parent.mkdir(parents=True, exist_ok=True)
+                np.save(out_csd_pre, np.stack(Cs)); np.save(out_csd_post, np.stack(Cs_h))
+                csd_outputs = {"csd_pre": str(out_csd_pre), "csd_post": str(out_csd_post)}
+            except RuntimeError as re:
+                # Soft-fail CSD and continue with the rest of the pipeline
+                Path(P.reports / "error.log").write_text(str(re))
+            except Exception as ex:
+                Path(P.reports / "error.log").write_text(str(ex))
+                # Re-raise as PipelineError if you prefer to hard-stop
+                raise
 
         # 7) ERP (optional; safe if no events—will still compute GFP peak)
         erp_outputs = {}
