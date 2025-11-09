@@ -1,8 +1,10 @@
 import streamlit as st
 from pathlib import Path
-import tempfile, shutil
+import tempfile
+import shutil
+import json
 
-# Defer heavy imports so the UI can render even if deps failed on Streamlit Cloud
+# Defer heavy imports so UI renders even if deps fail
 run_pipeline = None
 PipelineError = Exception
 _import_error = None
@@ -15,95 +17,101 @@ except Exception as e:
 
 st.set_page_config(page_title="EEG Harmonisation", layout="centered")
 st.title("EEG Harmonisation – One-Click Runner")
+st.caption("Upload a BIDS EEG ZIP or a single EEG file (EDF/BDF/BrainVision/EEGLAB/FIF). "
+           "Or provide a URL (HTTP/S3 presigned). Click **Run** to generate outputs.")
 
-st.caption("Upload a BIDS EEG ZIP or point at a local BIDS folder. Click **Run** to generate outputs.")
-
-tab1, tab2 = st.tabs(["Upload ZIP", "Use Local Folder"])
+# --------------------- Ingest Controls ---------------------
+tab_zip, tab_file, tab_url = st.tabs(["Upload ZIP", "Upload File", "From URL"])
 
 zip_tmp = None
-dataset_dir = None
+file_tmp = None
+url_val = None
 
-with tab1:
-    up = st.file_uploader("Upload BIDS dataset (.zip)", type=["zip"])
-    if up:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        tmp.write(up.read()); tmp.flush(); tmp.close()
-        zip_tmp = tmp.name
-        st.success("ZIP uploaded.")
+with tab_zip:
+    up = st.file_uploader("BIDS ZIP (≤200MB on Cloud recommended)", type=["zip"])
+    if up is not None:
+        tmpdir = tempfile.mkdtemp()
+        zip_tmp = str(Path(tmpdir) / up.name)
+        with open(zip_tmp, "wb") as f:
+            f.write(up.read())
+        st.success(f"Staged: {up.name}")
 
-with tab2:
-    pstr = st.text_input("Local BIDS folder", value="./data/ds000XYZ")
-    if pstr:
-        p = Path(pstr).expanduser().resolve()
-        if p.exists() and p.is_dir():
-            dataset_dir = str(p)
-            st.success(f"Using local folder: {dataset_dir}")
-        else:
-            st.warning("Folder not found.")
+with tab_file:
+    raw = st.file_uploader("Single EEG file (.edf/.bdf/.vhdr/.set/.fif/.cnt/.mff)", type=[
+        "edf", "bdf", "vhdr", "set", "fif", "cnt", "mff"
+    ])
+    if raw is not None:
+        tmpdir = tempfile.mkdtemp()
+        file_tmp = str(Path(tmpdir) / raw.name)
+        with open(file_tmp, "wb") as f:
+            f.write(raw.read())
+        st.success(f"Staged: {raw.name}")
 
-col1, col2, col3 = st.columns(3)
-subject = col1.text_input("Subject (optional)", "")
-task    = col2.text_input("Task (optional)", "")
-outroot = col3.text_input("Output root", ".")
+with tab_url:
+    url_val = st.text_input("HTTP/S3 URL to a ZIP or single EEG file")
 
-st.divider()
-c1, c2 = st.columns(2)
-include_erp = c1.checkbox("Include ERP harmonisation", value=True)
-include_csd = c2.checkbox("Include Riemannian CSD harmonisation", value=True)
+# --------------------- Run Parameters ---------------------
+st.subheader("Run Settings")
+col1, col2 = st.columns(2)
+with col1:
+    include_erp = st.checkbox("Include ERP", value=True)
+    include_csd = st.checkbox("Include Riemannian CSD (heavier)", value=False)
+with col2:
+    target_sfreq = st.number_input("Target sampling rate (Hz)", 64, 512, 128, step=64)
+    max_seconds = st.number_input("Max seconds per file (crop)", 60, 3600, 300, step=60)
+
+subject_override = st.text_input("Subject (optional override)", "")
+task_override = st.text_input("Task (optional override)", "")
+
+outroot = st.text_input("Output root (server-side path)", "./outputs")
 
 run_btn = st.button("Run Harmonisation", type="primary")
 
+# --------------------- Execution --------------------------
 if run_btn:
     if run_pipeline is None:
-        st.error("Core modules not loaded. This usually means a missing package (e.g., 'mne'). "
-                 "See 'Diagnostics' below and reboot the app after fixing requirements.")
-        st.stop()
-    if not (zip_tmp or dataset_dir):
-        st.error("Select a ZIP or a valid folder.")
+        st.error("Core modules not loaded. Likely a missing package (e.g., 'mne'). "
+                 "See Diagnostics below and fix requirements.")
         st.stop()
 
-    ds_input = dataset_dir
-    if zip_tmp:
-        data_dir = Path(outroot) / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        dest_zip = data_dir / Path(zip_tmp).name
-        shutil.move(zip_tmp, dest_zip)
-        ds_input = str(dest_zip)
+    src = zip_tmp or file_tmp or url_val
+    if not src:
+        st.error("Provide a ZIP, a single EEG file, or a URL.")
+        st.stop()
 
-    st.info("Running pipeline…")
     try:
         summary = run_pipeline(
-            ds_input,
-            subject=subject or None,
-            task=task or None,
+            dataset_path=src,
+            subject=subject_override or None,
+            task=task_override or None,
             out_root=outroot,
             include_erp=include_erp,
             include_csd=include_csd,
+            target_sfreq=int(target_sfreq),
+            max_seconds=int(max_seconds),
         )
         st.success("Done.")
-        st.subheader("Summary")
         st.json(summary)
 
-        reports_dir = Path(outroot) / "reports"
-        figures_dir = Path(outroot) / "figures"
+        md_path = Path(summary["outputs"]["report_markdown"])
+        if md_path.exists():
+            st.download_button("Download one-pager (Markdown)",
+                               data=md_path.read_text(),
+                               file_name=md_path.name,
+                               mime="text/markdown")
 
-        # Download buttons
-        eval_json = reports_dir / "eval_summary.json"
-        eval_md   = reports_dir / "eval_summary.md"
-        if eval_json.exists():
-            st.download_button("Download evaluation JSON", eval_json.read_bytes(), "eval_summary.json")
-        if eval_md.exists():
-            st.download_button("Download one-pager (Markdown)", eval_md.read_text(), "eval_summary.md")
+        bundle = Path(summary["outputs"]["results_bundle_zip"])
+        if bundle.exists():
+            st.download_button("Download results bundle (ZIP)",
+                               data=bundle.read_bytes(),
+                               file_name=bundle.name,
+                               mime="application/zip")
 
-        # Show figures
-        if figures_dir.exists():
-            pngs = list(figures_dir.glob("*.png"))
-            if pngs:
-                st.subheader("Figures")
-                for p in pngs:
-                    st.image(str(p), caption=p.name, use_column_width=True)
-            else:
-                st.caption("No figures generated yet.")
+        # Quick links to artifacts
+        with st.expander("Artifacts"):
+            for k, v in summary["outputs"].items():
+                st.write(f"**{k}** → `{v}`")
+
     except PipelineError as e:
         st.error(f"Pipeline failed: {e}")
         logf = Path(outroot) / "reports" / "error.log"
@@ -111,7 +119,7 @@ if run_btn:
             with st.expander("Error log"):
                 st.code(logf.read_text())
 
-# --- Diagnostics (always available) -------------------------------------------
+# --------------------- Diagnostics ------------------------
 st.divider()
 with st.expander("Diagnostics"):
     import sys, platform, pkgutil
@@ -133,8 +141,8 @@ with st.expander("Diagnostics"):
         import pyriemann
         st.write("pyriemann version:", pyriemann.__version__)
     except Exception as e:
-        st.info(f"pyriemann import: {e}")
-    st.caption("Installed packages (subset):")
+        st.warning(f"pyriemann check: {e}")
+    st.caption("Installed (subset):")
     pkgs = sorted([m.name for m in pkgutil.iter_modules()])
-    st.code(", ".join(x for x in pkgs if x.lower().startswith(
-        ("mne","numpy","scipy","pandas","pyriemann","neuro","streamlit"))))
+    st.code(", ".join(x for x in pkgs if x.lower().startswith((
+        "mne", "numpy", "scipy", "pandas", "pyriemann", "neuro", "streamlit"))))
