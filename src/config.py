@@ -1,3 +1,4 @@
+from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,12 +10,12 @@ class Paths:
     figures: Path
     reports: Path
 
-def default_paths(root: str | Path = ".") -> Paths:
-    r = Path(root).resolve()
+def default_paths(root: str | Path) -> Paths:
+    root = Path(root).resolve()
     return Paths(
-        root=r,
-        bids_root=r / "data",
-        derivatives=r / "derivatives",
-        figures=r / "figures",
-        reports=r / "reports",
+        root=root,
+        bids_root=root / "bids",
+        derivatives=root / "derivatives",
+        figures=root / "figures",
+        reports=root / "reports",
     )
