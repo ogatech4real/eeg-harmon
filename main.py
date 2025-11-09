@@ -1,6 +1,14 @@
 from __future__ import annotations
 from pathlib import Path
-import shutil, zipfile, json, traceback, time, sys, platform
+import shutil
+import zipfile
+import json
+import traceback
+import time
+import sys
+import platform
+import tempfile
+import requests
 import numpy as np
 import pandas as pd
 import mne
@@ -15,12 +23,14 @@ from src.io_bids import (
 from src.preproc import basic_preproc
 from src.features import bandpowers, cross_spectra, erp_peaks
 from src.harmonize import combat_vector_features, combat_riemann
-from src.metrics import site_variance_ratio
+from src.metrics import site_variance_ratio, preservation_delta
+from src.reporting import write_markdown, create_results_bundle
+from src.utils.bidsify import bidsify, is_eeg_file
 
 class PipelineError(Exception):
     ...
 
-# --- utilities ----------------------------------------------------------------
+# ---------------- utilities ----------------
 def _unzip_if_needed(upload: Path, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     if upload.suffix.lower() == ".zip":
@@ -32,21 +42,15 @@ def _unzip_if_needed(upload: Path, dest_dir: Path) -> Path:
         return target
     return upload
 
-def _write_markdown(summary: dict, path: Path):
-    lines = []
-    lines.append("# Harmonisation Evaluation Summary\n\n")
-    lines.append(f"- **Dataset**: `{summary['dataset_root']}`\n")
-    lines.append(f"- **Subject/Task**: `{summary['subject']}` / `{summary['task']}`\n")
-    pre = summary["site_variance_ratio_pre"]; post = summary["site_variance_ratio_post"]
-    delta_pp = (pre - post) * 100.0
-    lines.append(f"- **Site-variance ratio**: pre = **{pre:.3f}**, post = **{post:.3f}** (Δ = **{delta_pp:.1f} pp**)\n")
-    lines.append("\n## What this means\n")
-    lines.append("- Lower post-harmonisation ratio ⇒ reduced non-biological site noise.\n")
-    lines.append("- Biological preservation checks (age/condition) are run when covariates exist.\n")
-    lines.append("\n## Outputs\n")
-    for k, v in summary.get("outputs", {}).items():
-        lines.append(f"- **{k}** → `{v}`\n")
-    path.write_text("".join(lines))
+def _download_stream(url: str, out_path: Path, chunk=8 * 1024 * 1024) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for cb in r.iter_content(chunk_size=chunk):
+                if cb:
+                    f.write(cb)
+    return out_path
 
 def _write_run_meta(subject: str, task: str, out_dir: Path):
     meta = {
@@ -58,45 +62,85 @@ def _write_run_meta(subject: str, task: str, out_dir: Path):
     }
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2))
 
-# --- orchestrator --------------------------------------------------------------
+# --------------- orchestrator ---------------
 def run_pipeline(
     dataset_path: str,
     subject: str | None = None,
     task: str | None = None,
     out_root: str = ".",
     include_erp: bool = True,
-    include_csd: bool = True,
+    include_csd: bool = False,
+    target_sfreq: int = 128,
+    max_seconds: int = 300,
 ) -> dict:
     """
-    Minimal end-to-end execution with toggles for ERP and CSD.
-    - dataset_path: BIDS folder OR .zip of a BIDS dataset
-    - subject/task: if None/empty, will be auto-discovered from the dataset
-    - outputs: derivatives/, figures/, reports/
+    End-to-end run with robust ingest:
+    - dataset_path: BIDS folder OR .zip OR URL OR a single EEG file path
+    - subject/task: optional overrides; otherwise auto-discover/infer
+    - outputs: derivatives/, figures/, reports/, plus results bundle ZIP
     """
     P = default_paths(out_root)
     for d in [P.bids_root, P.derivatives, P.figures, P.reports]:
         Path(d).mkdir(parents=True, exist_ok=True)
 
     try:
-        # 0) Validate & ingest
-        ds_path = _unzip_if_needed(Path(dataset_path), P.bids_root)
+        # 0) Ingest: URL / File / ZIP / Folder
+        ds_path = None
+        sp = Path(dataset_path)
+
+        if dataset_path.startswith("http://") or dataset_path.startswith("https://"):
+            tmp = Path(tempfile.mkdtemp()) / "remote_input"
+            if dataset_path.lower().endswith(".zip"):
+                local = _download_stream(dataset_path, tmp.with_suffix(".zip"))
+                ds_path = _unzip_if_needed(local, P.bids_root)
+            else:
+                # single EEG file → BIDSify
+                local = _download_stream(dataset_path, tmp)
+                res = bidsify(local, P.bids_root, subject=subject, task=task)
+                ds_path, subject, task = res.bids_root, res.subject, res.task
+
+        elif sp.is_file():
+            if sp.suffix.lower() == ".zip":
+                ds_path = _unzip_if_needed(sp, P.bids_root)
+            elif is_eeg_file(sp):
+                res = bidsify(sp, P.bids_root, subject=subject, task=task)
+                ds_path, subject, task = res.bids_root, res.subject, res.task
+            else:
+                raise PipelineError(f"Unsupported file: {sp.name}")
+
+        elif sp.is_dir():
+            ds_path = sp
+        else:
+            raise PipelineError("Input not found or unsupported.")
+
+        # 1) Validate BIDS
         v = validate_bids_root(ds_path)
         if not v["is_bids"]:
-            raise PipelineError("Provided dataset does not look like BIDS (dataset_description.json missing).")
+            raise PipelineError("Dataset is not BIDS; auto-BIDSify did not succeed.")
 
-        # 1) Auto-discover subject/task if not provided
+        # 2) Auto-discover subject/task if not provided
         if not subject or not task:
             dsub, dtask = discover_subject_task(ds_path)
             subject = subject or dsub
             task = task or dtask
 
-        _write_run_meta(subject, task, P.reports)
+        # Record run metadata + params
+        _write_run_meta(subject, task, Path(P.reports))
+        params = {
+            "include_erp": include_erp,
+            "include_csd": include_csd,
+            "target_sfreq": target_sfreq,
+            "max_seconds": max_seconds,
+        }
+        (Path(P.reports) / "params.json").write_text(json.dumps(params, indent=2))
 
-        # 2) Load raw
+        # 3) Load & preprocess → epochs (fixed-length if no events)
         raw = load_raw(ds_path, subject=subject, task=task)
-
-        # 3) Preprocess → epochs (fixed-length if no events)
-        epochs, _ = basic_preproc(raw, epoch_event_id=None)
+        epochs, info = basic_preproc(
+            raw,
+            target_sfreq=target_sfreq,
+            max_seconds=max_seconds,
+        )
         if isinstance(epochs, mne.io.BaseRaw):
             epochs = mne.make_fixed_length_epochs(epochs, duration=2.0, preload=True)
 
@@ -107,21 +151,20 @@ def run_pipeline(
         df_bp = bandpowers(epochs, bands)  # columns: epoch, band, value
         df_wide = df_bp.pivot(index="epoch", columns="band", values="value").reset_index()
 
-        # Attach site labels if available, else stub to 'siteA'
+        # Site labels
         site_vec = get_per_epoch_site_vector(ds_path, subject, n_epochs)
         if site_vec is None or len(site_vec) != n_epochs:
-            site_vec = ["siteA"] * n_epochs  # fallback
+            site_vec = ["siteA"] * n_epochs
             site_note = "Site labels not found; used fallback."
         else:
             site_note = "Site labels inferred from participants.tsv."
-
         df_wide["site"] = site_vec
 
         # KPI pre
-        feat = "alpha" if "alpha" in df_wide.columns else [c for c in df_wide.columns if c not in {"epoch","site"}][0]
+        feat = "alpha" if "alpha" in df_wide.columns else [c for c in df_wide.columns if c not in {"epoch", "site"}][0]
         pre_ratio = site_variance_ratio(df_wide.rename(columns={feat: "feat"}), ["feat"], "site")
 
-        # 5) Vector ComBat
+        # 5) Vector ComBat Harmonisation
         df_h, _ = combat_vector_features(
             df_wide.rename(columns={feat: "feat"}), feature_cols=["feat"], batch_col="site", covars=[]
         )
@@ -136,31 +179,22 @@ def run_pipeline(
         out_feat_h.parent.mkdir(parents=True, exist_ok=True)
         df_h.to_parquet(out_feat_h, index=False)
 
-        # 6) CSD (Riemannian) — optional and resilient
+        # 6) CSD (Riemannian) — optional
         csd_outputs = {}
         if include_csd:
-            try:
-                Cs = cross_spectra(epochs, fmin=8.0, fmax=30.0, method="multitaper")
-                # If site labels are single-valued, synthesise a simple A/B split to visualise the effect
-                if len(set(site_vec)) == 1:
-                    batch = ["siteA" if (i % 2 == 0) else "siteB" for i in range(n_epochs)]
-                else:
-                    batch = site_vec
-                Cs_h = combat_riemann(Cs, batch=batch, covars=None)
-                out_csd_pre = Path(P.derivatives / "harmonized" / "csd" / "csd_pre.npy")
-                out_csd_post = Path(P.derivatives / "harmonized" / "csd" / "csd_post_harmonized.npy")
-                out_csd_pre.parent.mkdir(parents=True, exist_ok=True)
-                np.save(out_csd_pre, np.stack(Cs)); np.save(out_csd_post, np.stack(Cs_h))
-                csd_outputs = {"csd_pre": str(out_csd_pre), "csd_post": str(out_csd_post)}
-            except RuntimeError as re:
-                # Soft-fail CSD and continue with the rest of the pipeline
-                Path(P.reports / "error.log").write_text(str(re))
-            except Exception as ex:
-                Path(P.reports / "error.log").write_text(str(ex))
-                # Re-raise as PipelineError if you prefer to hard-stop
-                raise
+            Cs = cross_spectra(epochs, fmin=8.0, fmax=30.0, method="multitaper")
+            if len(set(site_vec)) == 1:
+                batch = ["siteA" if (i % 2 == 0) else "siteB" for i in range(n_epochs)]
+            else:
+                batch = site_vec
+            Cs_h = combat_riemann(Cs, batch=batch, covars=None)
+            out_csd_pre = Path(P.derivatives / "harmonized" / "csd" / "csd_pre.npy")
+            out_csd_post = Path(P.derivatives / "harmonized" / "csd" / "csd_post_harmonized.npy")
+            out_csd_pre.parent.mkdir(parents=True, exist_ok=True)
+            np.save(out_csd_pre, np.stack(Cs)); np.save(out_csd_post, np.stack(Cs_h))
+            csd_outputs = {"csd_pre": str(out_csd_pre), "csd_post": str(out_csd_post)}
 
-        # 7) ERP (optional; safe if no events—will still compute GFP peak)
+        # 7) ERP (optional; safe if no events—GFP peak fallback in erp_peaks)
         erp_outputs = {}
         if include_erp:
             erp_df = erp_peaks(epochs, tmin=0.25, tmax=0.45)
@@ -169,7 +203,7 @@ def run_pipeline(
             erp_df.to_parquet(out_erp, index=False)
             erp_outputs = {"erp": str(out_erp)}
 
-        # 8) Summary + markdown
+        # 8) Summary + reporting + bundle
         summary = {
             "dataset_root": str(ds_path),
             "subject": subject,
@@ -185,8 +219,19 @@ def run_pipeline(
                 **erp_outputs,
             },
         }
-        Path(P.reports / "eval_summary.json").write_text(json.dumps(summary, indent=2))
-        _write_markdown(summary, Path(P.reports / "eval_summary.md"))
+
+        # Write report files
+        eval_json = Path(P.reports / "eval_summary.json")
+        eval_md = Path(P.reports / "eval_summary.md")
+        eval_json.write_text(json.dumps(summary, indent=2))
+        write_markdown(summary, eval_md)
+
+        # Results bundle ZIP
+        bundle_zip = create_results_bundle(P)
+        summary["outputs"]["report_markdown"] = str(eval_md)
+        summary["outputs"]["report_json"] = str(eval_json)
+        summary["outputs"]["results_bundle_zip"] = str(bundle_zip)
+
         return summary
 
     except Exception as e:
@@ -195,4 +240,4 @@ def run_pipeline(
         raise PipelineError(str(e)) from e
 
 if __name__ == "__main__":
-    print(json.dumps(run_pipeline("./data/ds000XYZ"), indent=2))
+    print(json.dumps(run_pipeline("./data/ds_example"), indent=2))
