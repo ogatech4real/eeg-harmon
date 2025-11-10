@@ -9,6 +9,7 @@ import sys
 import platform
 import tempfile
 import requests
+from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 import mne
@@ -44,7 +45,7 @@ def _unzip_if_needed(upload: Path, dest_dir: Path) -> Path:
 
 def _download_stream(url: str, out_path: Path, chunk=8 * 1024 * 1024) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=120) as r:
+    with requests.get(url, stream=True, timeout=120, allow_redirects=True) as r:
         r.raise_for_status()
         with open(out_path, "wb") as f:
             for cb in r.iter_content(chunk_size=chunk):
@@ -61,6 +62,41 @@ def _write_run_meta(subject: str, task: str, out_dir: Path):
         "task": task,
     }
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2))
+
+def _is_zip_download(url: str) -> bool:
+    """
+    Heuristics to decide if a URL returns a ZIP even if it has no .zip suffix.
+    - Handles OpenNeuro snapshot/versions /download endpoints.
+    - Falls back to HEAD Content-Type.
+    """
+    u = urlparse(url)
+    host = (u.netloc or "").lower()
+    path = (u.path or "").lower()
+
+    # OpenNeuro patterns (both legacy and current)
+    if "openneuro.org" in host and path.endswith("/download"):
+        # e.g., /crn/datasets/dsXXXXXX/snapshots/1.0.0/download
+        # or    /datasets/dsXXXXXX/versions/1.0.0/download
+        return True
+
+    # If it actually ends with .zip
+    if path.endswith(".zip"):
+        return True
+
+    # HEAD check
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=20)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        # Some servers report generic octet-stream; treat as zip for dataset endpoints
+        if "zip" in ct or "application/x-zip-compressed" in ct:
+            return True
+        if "application/octet-stream" in ct and path.endswith("/download"):
+            return True
+    except Exception:
+        # If HEAD fails, be conservative (not a zip) unless /download
+        return path.endswith("/download")
+
+    return False
 
 # --------------- orchestrator ---------------
 def run_pipeline(
@@ -88,15 +124,18 @@ def run_pipeline(
         ds_path = None
         sp = Path(dataset_path)
 
-        if dataset_path.startswith("http://") or dataset_path.startswith("https://"):
-            tmp = Path(tempfile.mkdtemp()) / "remote_input"
-            if dataset_path.lower().endswith(".zip"):
-                local = _download_stream(dataset_path, tmp.with_suffix(".zip"))
-                ds_path = _unzip_if_needed(local, P.bids_root)
+        if dataset_path.startswith(("http://", "https://")):
+            tmp_dir = Path(tempfile.mkdtemp())
+            if _is_zip_download(dataset_path):
+                # Stream to temp zip, then unzip to BIDS
+                local_zip = tmp_dir / "dataset.zip"
+                _download_stream(dataset_path, local_zip)
+                ds_path = _unzip_if_needed(local_zip, P.bids_root)
             else:
-                # single EEG file → BIDSify
-                local = _download_stream(dataset_path, tmp)
-                res = bidsify(local, P.bids_root, subject=subject, task=task)
+                # Assume a single EEG file → bidsify
+                local_file = tmp_dir / "remote_input"
+                _download_stream(dataset_path, local_file)
+                res = bidsify(local_file, P.bids_root, subject=subject, task=task)
                 ds_path, subject, task = res.bids_root, res.subject, res.task
 
         elif sp.is_file():
