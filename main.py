@@ -1,40 +1,33 @@
 from __future__ import annotations
 from pathlib import Path
-import shutil
-import zipfile
-import json
-import traceback
-import time
-import sys
-import platform
-import tempfile
+import shutil, zipfile, json, traceback, time, sys, platform, tempfile
 import requests
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import numpy as np
 import pandas as pd
 import mne
 
 from src.config import default_paths
 from src.io_bids import (
-    load_raw,
-    discover_subject_task,
-    validate_bids_root,
-    get_per_epoch_site_vector,
+    load_raw, discover_subject_task, validate_bids_root, get_per_epoch_site_vector,
 )
 from src.preproc import basic_preproc
 from src.features import bandpowers, cross_spectra, erp_peaks
 from src.harmonize import combat_vector_features, combat_riemann
-from src.metrics import site_variance_ratio, preservation_delta
+from src.metrics import site_variance_ratio
 from src.reporting import write_markdown, create_results_bundle
 from src.utils.bidsify import bidsify, is_eeg_file
 
-class PipelineError(Exception):
-    ...
+class PipelineError(Exception): ...
 
 # ---------------- utilities ----------------
 def _unzip_if_needed(upload: Path, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     if upload.suffix.lower() == ".zip":
+        # validate real zip (avoid HTML/JSON)
+        if not zipfile.is_zipfile(upload):
+            head = Path(upload).read_bytes()[:256]
+            raise PipelineError("Downloaded file is not a ZIP (server likely returned HTML/JSON).")
         target = dest_dir / upload.stem
         if target.exists():
             shutil.rmtree(target)
@@ -43,10 +36,95 @@ def _unzip_if_needed(upload: Path, dest_dir: Path) -> Path:
         return target
     return upload
 
+def _http_head(url: str) -> requests.Response | None:
+    try:
+        return requests.head(url, allow_redirects=True, timeout=20)
+    except Exception:
+        return None
+
+def _is_zip_download(url: str) -> bool:
+    """
+    Detect if URL will return a ZIP (even without .zip suffix).
+    Handles OpenNeuro /download and Google Drive uc?export=download&id=...
+    """
+    u = urlparse(url)
+    host = (u.netloc or "").lower()
+    path = (u.path or "").lower()
+    qs = {k.lower(): v for k, v in parse_qs(u.query).items()}
+
+    # OpenNeuro snapshot/versions download endpoints
+    if "openneuro.org" in host and path.endswith("/download"):
+        return True
+
+    # Google Drive direct export
+    if "drive.google.com" in host:
+        # uc?export=download&id=FILEID or file/d/FILEID/view -> we will force export
+        return True
+
+    # Plain .zip suffix
+    if path.endswith(".zip"):
+        return True
+
+    # HEAD content type heuristic
+    r = _http_head(url)
+    if r is not None:
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "zip" in ct or "x-zip" in ct:
+            return True
+        if "application/octet-stream" in ct and path.endswith("/download"):
+            return True
+
+    return False
+
 def _download_stream(url: str, out_path: Path, chunk=8 * 1024 * 1024) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, stream=True, timeout=120, allow_redirects=True) as r:
         r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for cb in r.iter_content(chunk_size=chunk):
+                if cb:
+                    f.write(cb)
+    return out_path
+
+def _download_google_drive(url: str, out_path: Path, chunk=8 * 1024 * 1024) -> Path:
+    """
+    Robust Google Drive downloader handling large-file confirmation.
+    Accepts:
+      - https://drive.google.com/file/d/<FILE_ID>/view
+      - https://drive.google.com/uc?export=download&id=<FILE_ID>
+    """
+    session = requests.Session()
+    u = urlparse(url)
+    qs = parse_qs(u.query)
+    file_id = None
+    if "uc" in u.path and "id" in qs:
+        file_id = qs["id"][0]
+    elif "/file/d/" in u.path:
+        # /file/d/<ID>/view
+        parts = u.path.split("/")
+        try:
+            idx = parts.index("d")
+            file_id = parts[idx + 1]
+        except Exception:
+            pass
+    if not file_id:
+        # fallback: try as-is (may still work for already-direct links)
+        _download_stream(url, out_path, chunk)
+        return out_path
+
+    base = "https://drive.google.com/uc?export=download"
+    params = {"id": file_id}
+    with session.get(base, params=params, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        token = None
+        for k, v in r.cookies.items():
+            if k.startswith("download_warning"):
+                token = v
+                break
+        if token:
+            params["confirm"] = token
+            r = session.get(base, params=params, stream=True, timeout=120)
+            r.raise_for_status()
         with open(out_path, "wb") as f:
             for cb in r.iter_content(chunk_size=chunk):
                 if cb:
@@ -62,41 +140,6 @@ def _write_run_meta(subject: str, task: str, out_dir: Path):
         "task": task,
     }
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2))
-
-def _is_zip_download(url: str) -> bool:
-    """
-    Heuristics to decide if a URL returns a ZIP even if it has no .zip suffix.
-    - Handles OpenNeuro snapshot/versions /download endpoints.
-    - Falls back to HEAD Content-Type.
-    """
-    u = urlparse(url)
-    host = (u.netloc or "").lower()
-    path = (u.path or "").lower()
-
-    # OpenNeuro patterns (both legacy and current)
-    if "openneuro.org" in host and path.endswith("/download"):
-        # e.g., /crn/datasets/dsXXXXXX/snapshots/1.0.0/download
-        # or    /datasets/dsXXXXXX/versions/1.0.0/download
-        return True
-
-    # If it actually ends with .zip
-    if path.endswith(".zip"):
-        return True
-
-    # HEAD check
-    try:
-        r = requests.head(url, allow_redirects=True, timeout=20)
-        ct = (r.headers.get("Content-Type") or "").lower()
-        # Some servers report generic octet-stream; treat as zip for dataset endpoints
-        if "zip" in ct or "application/x-zip-compressed" in ct:
-            return True
-        if "application/octet-stream" in ct and path.endswith("/download"):
-            return True
-    except Exception:
-        # If HEAD fails, be conservative (not a zip) unless /download
-        return path.endswith("/download")
-
-    return False
 
 # --------------- orchestrator ---------------
 def run_pipeline(
@@ -127,14 +170,33 @@ def run_pipeline(
         if dataset_path.startswith(("http://", "https://")):
             tmp_dir = Path(tempfile.mkdtemp())
             if _is_zip_download(dataset_path):
-                # Stream to temp zip, then unzip to BIDS
                 local_zip = tmp_dir / "dataset.zip"
-                _download_stream(dataset_path, local_zip)
+                # Choose downloader based on host
+                host = urlparse(dataset_path).netloc.lower()
+                if "drive.google.com" in host:
+                    _download_google_drive(dataset_path, local_zip)
+                else:
+                    _download_stream(dataset_path, local_zip)
+                # Validate ZIP before unzipping
+                if not zipfile.is_zipfile(local_zip):
+                    # Provide a precise error with hints
+                    head = _http_head(dataset_path)
+                    ct = (head.headers.get("Content-Type") if head else "unknown")
+                    raise PipelineError(
+                        f"Remote URL did not return a ZIP (Content-Type: {ct}). "
+                        f"If this is OpenNeuro, use the snapshot URL "
+                        f"`https://openneuro.org/crn/datasets/<DS>/snapshots/<VER>/download`. "
+                        f"For Google Drive, ensure the file is shared and use a direct export link."
+                    )
                 ds_path = _unzip_if_needed(local_zip, P.bids_root)
             else:
                 # Assume a single EEG file → bidsify
                 local_file = tmp_dir / "remote_input"
-                _download_stream(dataset_path, local_file)
+                host = urlparse(dataset_path).netloc.lower()
+                if "drive.google.com" in host:
+                    _download_google_drive(dataset_path, local_file)
+                else:
+                    _download_stream(dataset_path, local_file)
                 res = bidsify(local_file, P.bids_root, subject=subject, task=task)
                 ds_path, subject, task = res.bids_root, res.subject, res.task
 
@@ -187,7 +249,7 @@ def run_pipeline(
 
         # 4) Spectral features (vector)
         bands = {"alpha": (8, 12), "beta": (13, 30)}
-        df_bp = bandpowers(epochs, bands)  # columns: epoch, band, value
+        df_bp = bandpowers(epochs, bands)
         df_wide = df_bp.pivot(index="epoch", columns="band", values="value").reset_index()
 
         # Site labels
@@ -210,11 +272,12 @@ def run_pipeline(
         post_ratio = site_variance_ratio(df_h, ["feat"], "site")
 
         # Save vector features
-        out_feat = Path(P.derivatives / "features" / "spectral.parquet")
+        P_deriv = Path(P.derivatives)
+        out_feat = P_deriv / "features" / "spectral.parquet"
         out_feat.parent.mkdir(parents=True, exist_ok=True)
         df_wide.to_parquet(out_feat, index=False)
 
-        out_feat_h = Path(P.derivatives / "harmonized" / "features_harmonized_combat.parquet")
+        out_feat_h = P_deriv / "harmonized" / "features_harmonized_combat.parquet"
         out_feat_h.parent.mkdir(parents=True, exist_ok=True)
         df_h.to_parquet(out_feat_h, index=False)
 
@@ -222,27 +285,25 @@ def run_pipeline(
         csd_outputs = {}
         if include_csd:
             Cs = cross_spectra(epochs, fmin=8.0, fmax=30.0, method="multitaper")
-            if len(set(site_vec)) == 1:
-                batch = ["siteA" if (i % 2 == 0) else "siteB" for i in range(n_epochs)]
-            else:
-                batch = site_vec
+            batch = site_vec if len(set(site_vec)) > 1 else ["siteA" if (i % 2 == 0) else "siteB" for i in range(n_epochs)]
             Cs_h = combat_riemann(Cs, batch=batch, covars=None)
-            out_csd_pre = Path(P.derivatives / "harmonized" / "csd" / "csd_pre.npy")
-            out_csd_post = Path(P.derivatives / "harmonized" / "csd" / "csd_post_harmonized.npy")
+            out_csd_pre = P_deriv / "harmonized" / "csd" / "csd_pre.npy"
+            out_csd_post = P_deriv / "harmonized" / "csd" / "csd_post_harmonized.npy"
             out_csd_pre.parent.mkdir(parents=True, exist_ok=True)
             np.save(out_csd_pre, np.stack(Cs)); np.save(out_csd_post, np.stack(Cs_h))
             csd_outputs = {"csd_pre": str(out_csd_pre), "csd_post": str(out_csd_post)}
 
-        # 7) ERP (optional; safe if no events—GFP peak fallback in erp_peaks)
+        # 7) ERP (optional)
         erp_outputs = {}
         if include_erp:
             erp_df = erp_peaks(epochs, tmin=0.25, tmax=0.45)
-            out_erp = Path(P.derivatives / "features" / "erp.parquet")
+            out_erp = P_deriv / "features" / "erp.parquet"
             out_erp.parent.mkdir(parents=True, exist_ok=True)
             erp_df.to_parquet(out_erp, index=False)
             erp_outputs = {"erp": str(out_erp)}
 
         # 8) Summary + reporting + bundle
+        P_reports = Path(P.reports)
         summary = {
             "dataset_root": str(ds_path),
             "subject": subject,
@@ -254,28 +315,23 @@ def run_pipeline(
             "outputs": {
                 "spectral": str(out_feat),
                 "spectral_harmonized": str(out_feat_h),
-                **csd_outputs,
-                **erp_outputs,
+                **csd_outputs, **erp_outputs,
             },
         }
-
-        # Write report files
-        eval_json = Path(P.reports / "eval_summary.json")
-        eval_md = Path(P.reports / "eval_summary.md")
+        eval_json = P_reports / "eval_summary.json"
+        eval_md = P_reports / "eval_summary.md"
         eval_json.write_text(json.dumps(summary, indent=2))
         write_markdown(summary, eval_md)
 
-        # Results bundle ZIP
         bundle_zip = create_results_bundle(P)
         summary["outputs"]["report_markdown"] = str(eval_md)
         summary["outputs"]["report_json"] = str(eval_json)
         summary["outputs"]["results_bundle_zip"] = str(bundle_zip)
-
         return summary
 
     except Exception as e:
-        Path(P.reports).mkdir(parents=True, exist_ok=True)
-        Path(P.reports / "error.log").write_text(traceback.format_exc())
+        Path(default_paths(out_root).reports).mkdir(parents=True, exist_ok=True)
+        Path(default_paths(out_root).reports / "error.log").write_text(traceback.format_exc())
         raise PipelineError(str(e)) from e
 
 if __name__ == "__main__":
